@@ -23,12 +23,12 @@ AI coding assistants lose context between sessions. `CONTINUITY.md` acts as a pe
 
 ## Requirements
 
-- [Bun](https://bun.sh/) (to run the server and the tests)
+- [Node.js](https://nodejs.org/) ≥ 22.18 (to run the server and the tests; TypeScript runs natively via type stripping)
 - [tiktoken](https://github.com/openai/tiktoken) (installed as a dependency; used for token counting)
 
 ## Installation
 
-The server is started with `bun src/index.ts` from this repository. Because MCP clients differ in whether they spawn the server with your project directory as the working directory, **always set `CONTINUITY_WORKTREE`** to the project root (the server falls back to the process working directory).
+The server is started with `node src/index.ts` from this repository. Because MCP clients differ in whether they spawn the server with your project directory as the working directory, **always set `CONTINUITY_WORKTREE`** to the project root (the server falls back to the process working directory).
 
 ### VS Code
 
@@ -38,7 +38,7 @@ The server is started with `bun src/index.ts` from this repository. Because MCP 
 {
   "servers": {
     "continuity": {
-      "command": "bun",
+      "command": "node",
       "args": ["/path/to/continuity-mcp/src/index.ts"],
       "env": { "CONTINUITY_WORKTREE": "${workspaceFolder}" }
     }
@@ -57,7 +57,7 @@ Then use the tool from Copilot Chat (agent mode): *“use the continuity tool to
   "mcp": {
     "continuity": {
       "type": "local",
-      "command": ["bun", "/path/to/continuity-mcp/src/index.ts"],
+      "command": ["node", "/path/to/continuity-mcp/src/index.ts"],
       "cwd": "."
     }
   }
@@ -67,7 +67,7 @@ Then use the tool from Copilot Chat (agent mode): *“use the continuity tool to
 ### Claude Code
 
 ```bash
-claude mcp add continuity --env CONTINUITY_WORKTREE=/path/to/project -- bun /path/to/continuity-mcp/src/index.ts
+claude mcp add continuity --env CONTINUITY_WORKTREE=/path/to/project -- node /path/to/continuity-mcp/src/index.ts
 ```
 
 For Claude Desktop, add the equivalent `mcpServers` entry (`command`, `args`, `env`) to `claude_desktop_config.json`.
@@ -302,9 +302,9 @@ continuity-mcp/
 ## Development
 
 ```bash
-bun install
-bun test tests/ --timeout 20000
-bun run typecheck
+npm install
+npm test
+npm run typecheck
 ```
 
 ## Roadmap

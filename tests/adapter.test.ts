@@ -1,4 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test"
+import { afterEach, beforeEach, describe, it } from "node:test"
+
+import { expect } from "./expect.ts"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
@@ -7,8 +9,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
 
-import { createServer } from "../src/index.js"
-import { resolveLedgerPath } from "../src/continuity.js"
+import { createServer } from "../src/index.ts"
+import { resolveLedgerPath } from "../src/continuity.ts"
 
 const CLIENT_NAME = "mcp-test-client"
 
@@ -154,10 +156,10 @@ describe("mcp adapter", () => {
 
   it("round-trips update and tail read over a spawned stdio server", async () => {
     const worktree = await createTempWorktree()
-    const serverEntry = path.resolve(import.meta.dir, "..", "src", "index.ts")
+    const serverEntry = path.resolve(import.meta.dirname!, "..", "src", "index.ts")
 
     const transport = new StdioClientTransport({
-      command: "bun",
+      command: "node",
       args: [serverEntry],
       env: {
         PATH: process.env.PATH ?? "",

@@ -4,8 +4,8 @@
   "type": "module",
   "description": "MCP stdio server: structured CONTINUITY.md management (delta reads, validated updates, token-budget compaction with MEMORY.md archival). Port of pi-continuity-tool.",
   "scripts": {
-    "start": "bun src/index.ts",
-    "test": "bun test tests/ --timeout 20000",
+    "start": "node src/index.ts",
+    "test": "node --test \"tests/**/*.test.ts\"",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
@@ -14,7 +14,7 @@
     "zod": "^3.23.0"
   },
   "devDependencies": {
-    "@types/bun": "^1.3.0",
+    "@types/node": "^24.0.0",
     "typescript": "^5.6.0"
   }
 }

@@ -1,4 +1,6 @@
-import { describe, expect, it } from "bun:test"
+import { describe, it } from "node:test"
+
+import { expect } from "./expect.ts"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
@@ -18,8 +20,8 @@ import {
   resolveLedgerPath,
   resolveProjectConfigPath,
   resolveWorktree,
-} from "../src/continuity.js"
-import type { ContinuityArgs } from "../src/continuity.js"
+} from "../src/continuity.ts"
+import type { ContinuityArgs } from "../src/continuity.ts"
 
 const tiktoken: any = await import("tiktoken")
 const get_encoding =

@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 /**
  * continuity-mcp — MCP stdio server entry.
  *
@@ -11,15 +11,18 @@
  * VS Code or Claude Desktop do not spawn the server with the project
  * directory as cwd), falling back to the process working directory.
  *
- * Run: bun src/index.ts
+ * Run: node src/index.ts
  */
+
+import path from "node:path"
+import { pathToFileURL } from "node:url"
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod"
 
-import { execute as executeContinuity } from "./continuity.js"
-import type { ContinuityArgs } from "./continuity.js"
+import { execute as executeContinuity } from "./continuity.ts"
+import type { ContinuityArgs } from "./continuity.ts"
 
 const DESCRIPTION =
   "Read or update CONTINUITY.md in the configured continuity directory. " +
@@ -158,6 +161,11 @@ export function createServer(): McpServer {
   return server
 }
 
-if (import.meta.main) {
+// Node equivalent of bun's import.meta.main (type stripping keeps import.meta).
+const isMain =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href
+
+if (isMain) {
   await createServer().connect(new StdioServerTransport())
 }
