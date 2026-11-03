@@ -1,0 +1,10 @@
+# Dependencies
+node_modules/
+
+# Continuity / memory runtime data (managed by the tool)
+docs/CONTINUITY.md
+docs/MEMORY.md
+
+# Tooling caches
+.ast-grep/
+tmp/
