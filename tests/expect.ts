@@ -44,11 +44,12 @@ const positive = {
     } else if (Array.isArray(actual)) {
       assert.ok(actual.includes(expected), `expected array to contain ${JSON.stringify(expected)}`)
     } else {
-      assert.fail("toContain expects a string or array")
+      throw new TypeError("toContain expects a string or array")
     }
   },
   toMatch: (actual: unknown, expected: RegExp) => {
-    assert.ok(expected.test(String(actual)), `expected "${String(actual)}" to match ${expected}`)
+    if (typeof actual !== "string") throw new TypeError("toMatch expects a string")
+    assert.ok(expected.test(actual), `expected "${actual}" to match ${expected}`)
   },
   toBeNull: (actual: unknown) => assert.strictEqual(actual, null),
   toBeUndefined: (actual: unknown) => assert.strictEqual(actual, undefined),
@@ -74,8 +75,9 @@ type Matcher = (...args: unknown[]) => void
 const invert = (fn: Matcher): Matcher => (...args: unknown[]) => {
   try {
     fn(...args)
-  } catch {
-    return // the positive assertion failed, so the negated matcher passes
+  } catch (error) {
+    if (error instanceof assert.AssertionError) return // positive failed, negated passes
+    throw error // wrong-typed actual is a bug, not a pass
   }
   assert.fail("expected the negated matcher to fail")
 }

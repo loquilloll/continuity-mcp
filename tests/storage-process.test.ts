@@ -89,7 +89,7 @@ async function fixture(run) {
       let stdout = "", stderr = ""
       child.stdout.on("data", (chunk) => { stdout += chunk })
       child.stderr.on("data", (chunk) => { stderr += chunk })
-      const result = new Promise((resolve) => child.on("exit", (code) => resolve({ code, stdout, stderr })))
+      const result = new Promise((resolve) => child.on("close", (code) => resolve({ code, stdout, stderr })))
       const entry = { child, result }
       children.push(entry)
       return entry

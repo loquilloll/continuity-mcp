@@ -183,7 +183,7 @@ describe("mcp adapter (v2 branch-isolated)", () => {
     const result: any = await callContinuity(client, { command: "distill" })
     expect(result.isError).toBeUndefined()
     const report = JSON.parse(result.content[0].text)
-    expect(typeof report).toBe("object")
+    expect(report.status).toBe("completed")
 
     await client.close()
     await server.close()
