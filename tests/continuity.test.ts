@@ -1,11 +1,11 @@
-import { describe, it } from "node:test"
-
+// @ts-nocheck -- ported from upstream bun:test suites; runtime-verified under node:test, kept close to upstream for syncs
+import { after as afterAll, describe, it } from "node:test"
 import { expect } from "./expect.ts"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
+import { continuityTool as tool } from "../src/index.ts"
 import {
-  execute,
   buildEntry,
   deriveMemoryId,
   hashMemoryContent,
@@ -20,14 +20,62 @@ import {
   resolveLedgerPath,
   resolveProjectConfigPath,
   resolveWorktree,
-} from "../src/continuity.ts"
-import type { ContinuityArgs } from "../src/continuity.ts"
+} from "../src/core.js"
 
-const tiktoken: any = await import("tiktoken")
+it("does not redirect legacy non-Git IDs into an unrelated transactional store", async () => {
+  const worktree = await createTempWorktree()
+  await tool.execute({ command: "update", updates: [{ section: "PROGRESS", provenance: "TOOL", text: "Legacy local work" }] }, { worktree })
+  await expect(tool.execute({ command: "read", read: { memoryId: "legacy-id" } }, { worktree })).rejects.toThrow("Non-Git standalone")
+  await expect(tool.execute({ command: "status" }, { worktree })).rejects.toThrow("Non-Git standalone")
+})
+import { executeLegacy, tokens, TEMPLATE } from "../src/core.js"
+
+const tiktoken = await import("tiktoken")
 const get_encoding =
   tiktoken.get_encoding ??
   tiktoken.default?.get_encoding ??
   tiktoken["module.exports"]?.get_encoding
+
+it("runs the SDK-independent core against an overlay with separate ledger identities", async () => {
+  const files = new Map()
+  const io = {
+    async readFile(filePath) {
+      if (!files.has(filePath)) throw Object.assign(new Error("missing"), { code: "ENOENT" })
+      return files.get(filePath)
+    },
+    async writeFile(filePath, content) { files.set(filePath, content) },
+    async mkdir() {},
+    async rename(from, to) { files.set(to, files.get(from)); files.delete(from) },
+  }
+  const directory = path.resolve("overlay-only")
+  const options = { paths: { directory }, fs: io, ledgerIdentity: "branch-a" }
+  await executeLegacy({
+    command: "update",
+    updates: [{ section: "PROGRESS", provenance: "CODE", text: "Overlay update." }],
+    compaction: { enabled: false },
+  }, {}, options)
+  expect(files.get(path.join(directory, "CONTINUITY.md"))).toContain("Overlay update.")
+  const read = { command: "read", read: { sessionId: "overlay-session" } }
+  expect(await executeLegacy(read, {}, options)).toContain("Overlay update.")
+  expect(await executeLegacy(read, {}, options)).toBe("No new or changed task memories.")
+  expect(await executeLegacy(read, {}, { ...options, ledgerIdentity: "branch-b" })).toContain("Overlay update.")
+  const encoder = get_encoding("cl100k_base")
+  try {
+    expect(tokens(TEMPLATE)).toBe(encoder.encode(TEMPLATE).length)
+    expect(tokens("again")).toBe(encoder.encode("again").length)
+  } finally {
+    encoder.free()
+  }
+})
+
+const originalXdgConfigHome = process.env.XDG_CONFIG_HOME
+const testConfigHome = await fs.mkdtemp(path.join(os.tmpdir(), "continuity-config-"))
+process.env.XDG_CONFIG_HOME = testConfigHome
+
+afterAll(() => {
+  if (originalXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME
+  else process.env.XDG_CONFIG_HOME = originalXdgConfigHome
+})
 
 const FIXTURE = `# CONTINUITY
 
@@ -114,7 +162,7 @@ async function createTempWorktree() {
   return await fs.mkdtemp(path.join(os.tmpdir(), "continuity-tool-"))
 }
 
-async function setupFixtureWorktree(fixtures: Record<string, string>) {
+async function setupFixtureWorktree(fixtures) {
   const worktree = await createTempWorktree()
   await Promise.all(
     Object.entries(fixtures).map(async ([relativePath, content]) => {
@@ -126,18 +174,18 @@ async function setupFixtureWorktree(fixtures: Record<string, string>) {
   return worktree
 }
 
-async function readContinuity(worktree: string, directory = "docs") {
+async function readContinuity(worktree, directory = "docs") {
   return await fs.readFile(
     path.join(worktree, directory, "CONTINUITY.md"),
     "utf8"
   )
 }
 
-async function readMemory(worktree: string, directory = "docs") {
+async function readMemory(worktree, directory = "docs") {
   return await fs.readFile(path.join(worktree, directory, "MEMORY.md"), "utf8")
 }
 
-async function readLedger(worktree: string, sessionId: string) {
+async function readLedger(worktree, sessionId) {
   const ledgerPath = resolveLedgerPath(worktree, sessionId)
   return JSON.parse(await fs.readFile(ledgerPath, "utf8"))
 }
@@ -153,7 +201,7 @@ async function readDummyFixture() {
   )
 }
 
-function getSectionLines(content: string, section: string) {
+function getSectionLines(content, section) {
   const lines = content.split(/\r?\n/)
   const header = `## [${section}]`
   const startIndex = lines.indexOf(header)
@@ -170,17 +218,17 @@ function getSectionLines(content: string, section: string) {
   return lines.slice(startIndex + 1, endIndex)
 }
 
-function getBulletLines(content: string, section: string) {
+function getBulletLines(content, section) {
   return getSectionLines(content, section).filter((line) =>
     line.startsWith("- ")
   )
 }
 
-function countTotalTokens(content: string, encoder: any) {
+function countTotalTokens(content, encoder) {
   return encoder.encode(content).length
 }
 
-function expectSectionOrder(content: string) {
+function expectSectionOrder(content) {
   const lines = content.split(/\r?\n/)
   const sections = [
     "PLANS",
@@ -196,7 +244,7 @@ function expectSectionOrder(content: string) {
   }
 }
 
-function extractTimestamp(line: string) {
+function extractTimestamp(line) {
   const match = line.match(
     /^\- (?:\[id:[^\]]+\] )?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z)/
   )
@@ -206,7 +254,7 @@ function extractTimestamp(line: string) {
   return match[1]
 }
 
-function extractMemoryId(line: string) {
+function extractMemoryId(line) {
   const match = line.match(/^\- \[id:([^\]]+)\]/)
   if (!match) {
     throw new Error(`Missing memory ID in line: ${line}`)
@@ -220,7 +268,7 @@ describe("continuity", () => {
       "docs/CONTINUITY.md": FIXTURE,
     })
 
-    const result = await execute(
+    const result = await tool.execute(
       {
         command: "update",
         updates: [
@@ -297,7 +345,7 @@ describe("continuity", () => {
       "docs/CONTINUITY.md": FIXTURE,
     })
 
-    await execute(
+    await tool.execute(
       {
         command: "update",
         updates: [
@@ -333,7 +381,7 @@ describe("continuity", () => {
   it("creates continuity file when missing", async () => {
     const worktree = await createTempWorktree()
 
-    await execute(
+    await tool.execute(
       {
         command: "update",
         updates: [
@@ -357,7 +405,7 @@ describe("continuity", () => {
   })
 
   it("falls back to the current working directory when worktree is missing or root-only", () => {
-    const cwd = path.resolve(path.join(path.sep, "tmp", "continuity-cwd"))
+    const cwd = path.resolve(path.sep, "tmp", "continuity-cwd")
     const filesystemRoot = path.parse(cwd).root
 
     expect(resolveWorktree({}, cwd)).toBe(cwd)
@@ -366,39 +414,33 @@ describe("continuity", () => {
   })
 
   it("resolves global and project config paths", () => {
-    const previousXdg = process.env.XDG_CONFIG_HOME
-    try {
-      delete process.env.XDG_CONFIG_HOME
-      expect(
-        resolveGlobalConfigPath({ homeDirectory: "/tmp/home" })
-      ).toBe(path.join("/tmp/home", ".config", "continuity", "continuity.json"))
-      process.env.XDG_CONFIG_HOME = "/xdg-config"
-      expect(
-        resolveGlobalConfigPath({ homeDirectory: "/tmp/home" })
-      ).toBe(path.join("/xdg-config", "continuity", "continuity.json"))
-    } finally {
-      if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME
-      else process.env.XDG_CONFIG_HOME = previousXdg
-    }
+    expect(
+      resolveGlobalConfigPath({
+        xdgConfigHome: "/tmp/xdg-config",
+        homeDirectory: "/tmp/home",
+      })
+    ).toBe(path.join("/tmp/xdg-config", "opencode", "continuity.json"))
+    expect(
+      resolveGlobalConfigPath({ xdgConfigHome: "  ", homeDirectory: "/tmp/home" })
+    ).toBe(path.join("/tmp/home", ".config", "opencode", "continuity.json"))
     expect(resolveProjectConfigPath("/tmp/project")).toBe(
-      path.join("/tmp/project", ".continuity", "continuity.json")
+      path.join("/tmp/project", ".opencode", "continuity.json")
     )
   })
 
   it("resolves configured directories relative to worktree and home", () => {
-    const worktree = path.resolve(path.join(path.sep, "tmp", "project"))
-    const homeDirectory = path.resolve(path.join(path.sep, "tmp", "home"))
-    const sharedDirectory = path.resolve(path.join(path.sep, "tmp", "shared"))
+    const worktree = "/tmp/project"
+    const homeDirectory = "/tmp/home"
 
     expect(resolveConfiguredDirectory(".ai-memory", worktree, homeDirectory)).toBe(
-      path.join(worktree, ".ai-memory")
+      path.resolve("/tmp/project", ".ai-memory")
     )
-    expect(resolveConfiguredDirectory(sharedDirectory, worktree, homeDirectory)).toBe(
-      sharedDirectory
+    expect(resolveConfiguredDirectory("/tmp/shared", worktree, homeDirectory)).toBe(
+      path.resolve("/tmp/shared")
     )
     expect(resolveConfiguredDirectory("~", worktree, homeDirectory)).toBe(homeDirectory)
     expect(resolveConfiguredDirectory("~/.continuity", worktree, homeDirectory)).toBe(
-      path.join(homeDirectory, ".continuity")
+      path.join("/tmp/home", ".continuity")
     )
     expect(() => resolveConfiguredDirectory("~other/files", worktree, homeDirectory)).toThrow(
       "Unsupported home-directory path"
@@ -440,26 +482,36 @@ describe("continuity", () => {
     const worktree = await setupFixtureWorktree({
       ".placeholder": "",
     })
-    const globalConfigPath = path.join(configRoot, "continuity.json")
+    await fs.mkdir(path.join(configRoot, "opencode"), { recursive: true })
     await fs.writeFile(
-      globalConfigPath,
+      path.join(configRoot, "opencode", "continuity.json"),
       JSON.stringify({ directory: ".ai-memory" }),
       "utf8"
     )
+    const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
+    process.env.XDG_CONFIG_HOME = configRoot
 
-    await execute(
-      {
-        command: "update",
-        updates: [
-          {
-            section: "PLANS",
-            provenance: "USER",
-            text: "Global configured location.",
-          },
-        ],
-      },
-      { worktree, globalConfigPath }
-    )
+    try {
+      await tool.execute(
+        {
+          command: "update",
+          updates: [
+            {
+              section: "PLANS",
+              provenance: "USER",
+              text: "Global configured location.",
+            },
+          ],
+        },
+        { worktree }
+      )
+    } finally {
+      if (previousXdgConfigHome === undefined) {
+        delete process.env.XDG_CONFIG_HOME
+      } else {
+        process.env.XDG_CONFIG_HOME = previousXdgConfigHome
+      }
+    }
 
     expect(await readContinuity(worktree, ".ai-memory")).toContain(
       "Global configured location."
@@ -470,28 +522,35 @@ describe("continuity", () => {
   it("prefers project config over global config", async () => {
     const configRoot = await createTempWorktree()
     const worktree = await setupFixtureWorktree({
-      ".continuity/continuity.json": JSON.stringify({ directory: ".project-memory" }),
+      ".opencode/continuity.json": JSON.stringify({ directory: ".project-memory" }),
     })
-    const globalConfigPath = path.join(configRoot, "continuity.json")
+    await fs.mkdir(path.join(configRoot, "opencode"), { recursive: true })
     await fs.writeFile(
-      globalConfigPath,
+      path.join(configRoot, "opencode", "continuity.json"),
       JSON.stringify({ directory: ".global-memory" }),
       "utf8"
     )
+    const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
+    process.env.XDG_CONFIG_HOME = configRoot
 
-    await execute(
-      {
-        command: "update",
-        updates: [
-          {
-            section: "PLANS",
-            provenance: "USER",
-            text: "Project configured location.",
-          },
-        ],
-      },
-      { worktree, globalConfigPath }
-    )
+    try {
+      await tool.execute(
+        {
+          command: "update",
+          updates: [
+            {
+              section: "PLANS",
+              provenance: "USER",
+              text: "Project configured location.",
+            },
+          ],
+        },
+        { worktree }
+      )
+    } finally {
+      if (previousXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME
+      else process.env.XDG_CONFIG_HOME = previousXdgConfigHome
+    }
 
     expect(await readContinuity(worktree, ".project-memory")).toContain(
       "Project configured location."
@@ -503,26 +562,33 @@ describe("continuity", () => {
     const configRoot = await createTempWorktree()
     const externalDirectory = path.join(await createTempWorktree(), "memory")
     const worktree = await createTempWorktree()
-    const globalConfigPath = path.join(configRoot, "continuity.json")
+    await fs.mkdir(path.join(configRoot, "opencode"), { recursive: true })
     await fs.writeFile(
-      globalConfigPath,
+      path.join(configRoot, "opencode", "continuity.json"),
       JSON.stringify({ directory: externalDirectory }),
       "utf8"
     )
+    const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
+    process.env.XDG_CONFIG_HOME = configRoot
 
-    await execute(
-      {
-        command: "update",
-        updates: [
-          {
-            section: "PLANS",
-            provenance: "USER",
-            text: "Absolute configured location.",
-          },
-        ],
-      },
-      { worktree, globalConfigPath }
-    )
+    try {
+      await tool.execute(
+        {
+          command: "update",
+          updates: [
+            {
+              section: "PLANS",
+              provenance: "USER",
+              text: "Absolute configured location.",
+            },
+          ],
+        },
+        { worktree }
+      )
+    } finally {
+      if (previousXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME
+      else process.env.XDG_CONFIG_HOME = previousXdgConfigHome
+    }
 
     expect(await fs.readFile(path.join(externalDirectory, "CONTINUITY.md"), "utf8")).toContain(
       "Absolute configured location."
@@ -532,12 +598,12 @@ describe("continuity", () => {
 
   it("rejects invalid project configuration without writing managed files", async () => {
     const worktree = await setupFixtureWorktree({
-      ".continuity/continuity.json": '{"directory":".memory","unexpected":true}',
+      ".opencode/continuity.json": '{"directory":".memory","unexpected":true}',
     })
     const configPath = resolveProjectConfigPath(worktree)
 
     await expect(
-      execute(
+      tool.execute(
         {
           command: "update",
           updates: [
@@ -557,7 +623,7 @@ describe("continuity", () => {
 
   it("rejects configured paths that are existing files", async () => {
     const worktree = await setupFixtureWorktree({
-      ".continuity/continuity.json": JSON.stringify({ directory: "not-a-directory" }),
+      ".opencode/continuity.json": JSON.stringify({ directory: "not-a-directory" }),
       "not-a-directory": "file",
     })
 
@@ -568,12 +634,12 @@ describe("continuity", () => {
 
   it("reads delta memories from the configured directory while retaining worktree ledger identity", async () => {
     const worktree = await setupFixtureWorktree({
-      ".continuity/continuity.json": JSON.stringify({ directory: ".memory" }),
+      ".opencode/continuity.json": JSON.stringify({ directory: ".memory" }),
       ".memory/CONTINUITY.md": DELTA_FIXTURE,
     })
     const sessionId = "configured-delta"
 
-    const output = await execute(
+    const output = await tool.execute(
       { command: "read", read: { sessionId } },
       { worktree }
     )
@@ -591,9 +657,9 @@ describe("continuity", () => {
       "docs/CONTINUITY.md": missingHeaderFixture,
     })
 
-    let error: any = null
+    let error = null
     try {
-      await execute(
+      await tool.execute(
         {
           command: "update",
           updates: [
@@ -622,9 +688,9 @@ describe("continuity", () => {
     })
     const before = await readContinuity(worktree)
 
-    let error: any = null
+    let error = null
     try {
-      await execute(
+      await tool.execute(
         {
           command: "update",
           updates: [
@@ -653,9 +719,9 @@ describe("continuity", () => {
     })
     const before = await readContinuity(worktree)
 
-    let error: any = null
+    let error = null
     try {
-      await execute(
+      await tool.execute(
         {
           command: "update",
           updates: [
@@ -763,7 +829,7 @@ describe("continuity", () => {
       "docs/CONTINUITY.md": FIXTURE,
     })
 
-    await execute(
+    await tool.execute(
       {
         command: "update",
         updates: [
@@ -810,7 +876,7 @@ describe("continuity", () => {
     })
     const before = await readContinuity(worktree)
 
-    const output = await execute(
+    const output = await tool.execute(
       {
         command: "read",
         read: {
@@ -845,7 +911,7 @@ describe("continuity", () => {
     })
     const before = await readContinuity(worktree)
 
-    const output = await execute(
+    const output = await tool.execute(
       {
         command: "read",
         read: {
@@ -872,7 +938,7 @@ describe("continuity", () => {
     const before = await readContinuity(worktree)
     const sessionId = "delta-first-read"
 
-    const output = await execute(
+    const output = await tool.execute(
       {
         command: "read",
         read: {
@@ -903,7 +969,7 @@ describe("continuity", () => {
       "docs/CONTINUITY.md": DELTA_FIXTURE,
     })
 
-    const request: ContinuityArgs = {
+    const request = {
       command: "read",
       read: {
         mode: "delta",
@@ -911,8 +977,8 @@ describe("continuity", () => {
       },
     }
 
-    await execute(request, { worktree })
-    const second = await execute(request, { worktree })
+    await tool.execute(request, { worktree })
+    const second = await tool.execute(request, { worktree })
 
     expect(second).toBe("No new or changed task memories.")
   })
@@ -922,7 +988,7 @@ describe("continuity", () => {
       "docs/CONTINUITY.md": READ_FIXTURE,
     })
 
-    const request: ContinuityArgs = {
+    const request = {
       command: "read",
       read: {
         mode: "delta",
@@ -930,8 +996,8 @@ describe("continuity", () => {
       },
     }
 
-    const first = await execute(request, { worktree })
-    const second = await execute(request, { worktree })
+    const first = await tool.execute(request, { worktree })
+    const second = await tool.execute(request, { worktree })
 
     expect(first).toContain("Second plan entry.")
     expect(first).toContain("First outcome entry.")
@@ -944,7 +1010,7 @@ describe("continuity", () => {
     })
     const sessionId = "delta-changed-hash"
 
-    await execute(
+    await tool.execute(
       {
         command: "read",
         read: {
@@ -965,7 +1031,7 @@ describe("continuity", () => {
       "utf8"
     )
 
-    const output = await execute(
+    const output = await tool.execute(
       {
         command: "read",
         read: {
@@ -986,7 +1052,7 @@ describe("continuity", () => {
     })
     const sessionId = "delta-pinned"
 
-    await execute(
+    await tool.execute(
       {
         command: "read",
         read: { mode: "delta", sessionId },
@@ -994,14 +1060,14 @@ describe("continuity", () => {
       { worktree }
     )
 
-    const withoutPinned = await execute(
+    const withoutPinned = await tool.execute(
       {
         command: "read",
         read: { mode: "delta", sessionId },
       },
       { worktree }
     )
-    const withPinned = await execute(
+    const withPinned = await tool.execute(
       {
         command: "read",
         read: { mode: "delta", sessionId, includePinned: true },
@@ -1019,7 +1085,7 @@ describe("continuity", () => {
     })
     const sessionId = "delta-unresolved"
 
-    await execute(
+    await tool.execute(
       {
         command: "read",
         read: { mode: "delta", sessionId },
@@ -1027,7 +1093,7 @@ describe("continuity", () => {
       { worktree }
     )
 
-    const withUnresolved = await execute(
+    const withUnresolved = await tool.execute(
       {
         command: "read",
         read: {
@@ -1048,7 +1114,7 @@ describe("continuity", () => {
     })
 
     await expect(
-      execute(
+      tool.execute(
         {
           command: "read",
           read: {},
@@ -1058,7 +1124,7 @@ describe("continuity", () => {
     ).rejects.toThrow("read.sessionId must be provided for delta mode")
 
     await expect(
-      execute(
+      tool.execute(
         {
           command: "read",
           read: { mode: "delta", sessionId: "/bad" },
@@ -1076,11 +1142,11 @@ describe("continuity", () => {
     })
 
     await expect(
-      execute(
+      tool.execute(
         {
           command: "read",
           read: { mode: "weird" },
-        } as any,
+        },
         { worktree }
       )
     ).rejects.toThrow('read.mode must be either "tail" or "delta"')
@@ -1092,7 +1158,7 @@ describe("continuity", () => {
     })
     const sessionId = "delta-ledger-path"
 
-    await execute(
+    await tool.execute(
       {
         command: "read",
         read: { mode: "delta", sessionId },
@@ -1115,7 +1181,7 @@ describe("continuity", () => {
     await fs.mkdir(path.dirname(ledgerPath), { recursive: true })
     await fs.writeFile(ledgerPath, "{not-json", "utf8")
 
-    const output = await execute(
+    const output = await tool.execute(
       {
         command: "read",
         read: { mode: "delta", sessionId },
@@ -1141,7 +1207,7 @@ describe("continuity", () => {
       "utf8"
     )
 
-    const output = await execute(
+    const output = await tool.execute(
       {
         command: "read",
         read: { mode: "delta", sessionId },
@@ -1160,7 +1226,7 @@ describe("continuity", () => {
     })
     const before = await readContinuity(worktree)
 
-    const output = await execute(
+    const output = await tool.execute(
       {
         command: "read",
         compaction: {
@@ -1190,7 +1256,7 @@ describe("continuity", () => {
       "docs/CONTINUITY.md": FIXTURE,
     })
 
-    const result = await execute(
+    const result = await tool.execute(
       {
         command: "update",
         updates: [
@@ -1222,7 +1288,7 @@ describe("continuity", () => {
       "docs/CONTINUITY.md": fixture,
     })
 
-    await execute(
+    await tool.execute(
       {
         command: "update",
         updates: [
@@ -1244,7 +1310,7 @@ describe("continuity", () => {
     expect(content).not.toContain("Compaction triggered")
     expectSectionOrder(content)
 
-    let memoryError: any = null
+    let memoryError = null
     try {
       await readMemory(worktree)
     } catch (error) {
@@ -1255,11 +1321,11 @@ describe("continuity", () => {
 
   it("archives compaction output beside a configured continuity file", async () => {
     const worktree = await setupFixtureWorktree({
-      ".continuity/continuity.json": JSON.stringify({ directory: ".memory" }),
+      ".opencode/continuity.json": JSON.stringify({ directory: ".memory" }),
       ".memory/CONTINUITY.md": FIXTURE,
     })
 
-    await execute(
+    await tool.execute(
       {
         command: "update",
         updates: [
@@ -1295,7 +1361,7 @@ describe("continuity", () => {
     const upperThreshold = 10000
     const lowerThreshold = 5000
     expect(fixtureTokens).toBeGreaterThan(upperThreshold)
-    await execute(
+    await tool.execute(
       {
         command: "update",
         updates: [
@@ -1333,7 +1399,7 @@ describe("continuity", () => {
       "docs/CONTINUITY.md": fixture,
     })
 
-    await execute(
+    await tool.execute(
       {
         command: "update",
         updates: [
@@ -1363,7 +1429,7 @@ describe("continuity", () => {
     const upperThreshold = 10000
     const derivedLowerThreshold = 5000
 
-    await execute(
+    await tool.execute(
       {
         command: "update",
         updates: [
@@ -1403,7 +1469,7 @@ describe("continuity", () => {
 
     const firstPlansEntry = getBulletLines(fixture, "PLANS")[0]
 
-    await execute(
+    await tool.execute(
       {
         command: "update",
         updates: [

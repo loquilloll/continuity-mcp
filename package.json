@@ -2,7 +2,7 @@
   "name": "continuity-mcp",
   "private": true,
   "type": "module",
-  "description": "MCP stdio server: structured CONTINUITY.md management (delta reads, validated updates, token-budget compaction with MEMORY.md archival). Port of pi-continuity-tool.",
+  "description": "MCP stdio server: branch-isolated continuity memory (read/update/status/search/distill, distillation via MCP sampling). Port of the opencode-continuity-tool redesign.",
   "scripts": {
     "start": "node src/index.ts",
     "test": "node --test \"tests/**/*.test.ts\"",
@@ -10,8 +10,8 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "tiktoken": "^1.0.22",
-    "zod": "^3.23.0"
+    "jsonc-parser": "^3.3.1",
+    "tiktoken": "^1.0.22"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

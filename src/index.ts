@@ -1,162 +1,157 @@
 #!/usr/bin/env node
 /**
- * continuity-mcp — MCP stdio server entry.
+ * continuity-mcp — MCP stdio server entry (v2: branch-isolated continuity).
  *
- * Registers one tool, `continuity`, that reads/updates CONTINUITY.md in the
- * configured continuity directory (default <worktree>/docs; sidecars:
- * <worktree>/.continuity/continuity.json,
- * $XDG_CONFIG_HOME|~/.config/continuity/continuity.json).
+ * Registers one tool, `continuity`, over the vendored SDK-independent runtime
+ * (read/update/status/search/distill). The store lives under
+ * <git-common-dir>/opencode-continuity/ (non-git workspaces keep the legacy
+ * docs/CONTINUITY.md behavior via the core's legacy path).
  *
- * The worktree comes from $CONTINUITY_WORKTREE (recommended — clients such as
- * VS Code or Claude Desktop do not spawn the server with the project
- * directory as cwd), falling back to the process working directory.
+ * - Worktree: $CONTINUITY_WORKTREE (recommended — clients such as VS Code or
+ *   Claude Desktop do not spawn the server with the project directory as cwd),
+ *   falling back to the process working directory.
+ * - Session: delta reads default to the connected MCP client's name.
+ * - Distill: model generation runs via MCP sampling — the client pays and
+ *   chooses the actual model; the configured model is a hint only.
+ * - Config: workspace .opencode/continuity.jsonc + global
+ *   OPENCODE_CONFIG_DIR|XDG_CONFIG_HOME|~/.config /opencode/continuity.jsonc
+ *   (shared with the opencode plugin; see schema/runtime docs).
+ *
+ * Uses the low-level Server (not McpServer.registerTool) so the vendored
+ * upstream JSON Schema is served as-is, without a zod conversion.
  *
  * Run: node src/index.ts
  */
 
+import os from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
+import { Server } from "@modelcontextprotocol/sdk/server/index.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
-import { z } from "zod"
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js"
 
-import { execute as executeContinuity } from "./continuity.ts"
-import type { ContinuityArgs } from "./continuity.ts"
+import { executeContinuity } from "./runtime.js"
+import { executeLegacy } from "./core.js"
+import { resolveScope } from "./storage.js"
+import { input as inputSchema, description } from "./schema.js"
 
 const DESCRIPTION =
-  "Read or update CONTINUITY.md in the configured continuity directory. " +
-  'READ: defaults to mode="delta", returning only new/changed memories for the ' +
-  'calling client (sessionId defaults to the MCP client name; set mode="tail" ' +
-  "for the latest entries per section). " +
-  "UPDATE: appends validated entries (updates[]) with optional token-budget compaction."
+  description +
+  " In MCP, the delta read sessionId defaults to the connected client's name."
 
-const SectionSchema = z.enum([
-  "PLANS",
-  "DECISIONS",
-  "PROGRESS",
-  "DISCOVERIES",
-  "OUTCOMES",
-])
-
-const ProvenanceSchema = z.enum([
-  "USER",
-  "CODE",
-  "TOOL",
-  "ASSUMPTION",
-  "UNCONFIRMED",
-])
-
-const inputSchema = {
-  command: z.enum(["read", "update"]).describe("Operation mode."),
-  updates: z
-    .array(
-      z.object({
-        section: SectionSchema.describe(
-          "PLANS, DECISIONS, PROGRESS, DISCOVERIES, or OUTCOMES.",
-        ),
-        provenance: ProvenanceSchema.describe(
-          "USER, CODE, TOOL, ASSUMPTION, or UNCONFIRMED.",
-        ),
-        plan: z
-          .string()
-          .regex(/^[a-z0-9][a-z0-9.-]*$/)
-          .optional()
-          .describe("Optional plan slug."),
-        text: z
-          .string()
-          .min(1)
-          .max(400)
-          .describe("Single-line, non-blank, 1-400 characters."),
-      }),
+// Mirrors upstream plugin.js globalConfigRoot so global settings are shared with the opencode plugin.
+function globalConfigRoot(): string {
+  return process.env.OPENCODE_CONFIG_DIR ??
+    path.join(
+      process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"),
+      "opencode",
     )
-    .optional()
-    .describe("Required for update. Entries to append."),
-  compaction: z
-    .object({
-      enabled: z.boolean().optional(),
-      upperTokenThreshold: z.number().int().min(1).optional(),
-      lowerTokenThreshold: z.number().int().min(1).optional(),
-      totalTokenThreshold: z.number().int().min(1).optional(),
-      encoding: z.string().optional(),
-    })
-    .optional()
-    .describe("Optional token-budget compaction settings for update."),
-  read: z
-    .object({
-      linesPerSection: z.number().int().min(1).optional(),
-      mode: z
-        .enum(["tail", "delta"])
-        .optional()
-        .describe(
-          '"delta" (default) returns only new/changed memories for the session; "tail" returns the latest linesPerSection entries per section.',
-        ),
-      sessionId: z
-        .string()
-        .optional()
-        .describe("Defaults to the MCP client name."),
-      includePinned: z.boolean().optional(),
-      includeUnresolved: z.boolean().optional(),
-    })
-    .optional()
-    .describe("Optional read output configuration."),
 }
 
-export function createServer(): McpServer {
-  const server = new McpServer({ name: "continuity-mcp", version: "1.0.0" })
+// Host wrapper equivalent of upstream src/continuity.js execute() — the MCP host has no
+// @opencode-ai/plugin tool() wrapper, so the non-Git dispatch lives here.
+export const continuityTool = {
+  async execute(args: any, context: { worktree: string }, options: Record<string, unknown> = {}) {
+    if (typeof context?.worktree !== "string") throw new Error("Continuity requires an attributed workspace")
+    const scope = await resolveScope({ workspace: context.worktree, branch: undefined })
+    // Keep the historical non-Git custom-tool contract; plugins always use the transactional runtime.
+    if (!scope.isGit && ["read", "update"].includes(args.command) && !args.branch && !args.read?.memoryId) {
+      return executeLegacy(args, context)
+    }
+    if (!scope.isGit) {
+      throw new Error("Non-Git standalone continuity supports legacy read/update only. Targeted reads, status and distillation require the plugin's transactional store; use a normal read for legacy journal IDs.")
+    }
+    return executeContinuity(args, context, options)
+  },
+}
+
+export function createServer(): Server {
+  const server = new Server(
+    { name: "continuity-mcp", version: "2.0.0" },
+    { capabilities: { tools: { listChanged: false } } },
+  )
 
   /** Delta sessions default to the connected client's name (stable across server restarts). */
   const defaultSessionId = (): string => {
-    const name = server.server.getClientVersion()?.name ?? "default"
+    const name = server.getClientVersion()?.name ?? "default"
     const sanitized = name
       .replace(/[^A-Za-z0-9._-]+/g, "-")
       .replace(/^[-.]+|[-.]+$/g, "")
     return sanitized || "default"
   }
 
-  // Serializes updates within this process — the SDK may deliver calls concurrently.
-  // shortcut: cross-process writers (e.g. the pi tool on the same files) remain unprotected
-  let updateChain: Promise<unknown> = Promise.resolve()
-  const serializeUpdate = <T>(run: () => Promise<T>): Promise<T> => {
-    const next = updateChain.then(run, run)
-    updateChain = next.catch(() => {})
-    return next
+  /** Distillation generation via MCP sampling (server → client request). */
+  const generate = async ({
+    prompt,
+    model,
+    signal,
+    maxOutputTokens,
+  }: {
+    prompt: string
+    model?: string
+    signal?: AbortSignal
+    maxOutputTokens?: number
+  }): Promise<string> => {
+    if (!server.getClientCapabilities()?.sampling) {
+      throw new Error("client does not support sampling; distill unavailable")
+    }
+    const result = await server.createMessage(
+      {
+        messages: [{ role: "user" as const, content: { type: "text" as const, text: prompt } }],
+        maxTokens: maxOutputTokens ?? 8000,
+        ...(model ? { modelPreferences: { hints: [{ name: model }] } } : {}),
+      },
+      { signal },
+    )
+    if (result.content.type !== "text") {
+      throw new Error(`sampling returned ${result.content.type} content; text required`)
+    }
+    return result.content.text
   }
 
-  server.registerTool(
-    "continuity",
-    { title: "Continuity", description: DESCRIPTION, inputSchema },
-    async (params) => {
-      const args = { ...params } as ContinuityArgs
-      const context = {
-        worktree: process.env.CONTINUITY_WORKTREE?.trim() || process.cwd(),
-      }
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [
+      {
+        name: "continuity",
+        title: "Continuity",
+        description: DESCRIPTION,
+        inputSchema,
+      },
+    ],
+  }))
 
-      try {
-        if (
-          args.command === "read" &&
-          (args.read?.mode ?? "delta") === "delta" &&
-          !args.read?.sessionId
-        ) {
-          args.read = { ...args.read, sessionId: defaultSessionId() }
-        }
-        const run = () => executeContinuity(args, context)
-        const text =
-          args.command === "update" ? await serializeUpdate(run) : await run()
-        return { content: [{ type: "text" as const, text }] }
-      } catch (error) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: error instanceof Error ? error.message : String(error),
-            },
-          ],
-          isError: true,
-        }
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    if (request.params.name !== "continuity") {
+      return {
+        content: [{ type: "text" as const, text: `Unknown tool: ${request.params.name}` }],
+        isError: true,
       }
-    },
-  )
+    }
+    const params = request.params.arguments ?? {}
+    const context = {
+      worktree: path.resolve(process.env.CONTINUITY_WORKTREE?.trim() || process.cwd()),
+      sessionID: defaultSessionId(),
+    }
+
+    try {
+      const text = await continuityTool.execute(params, context, {
+        generate,
+        globalConfigRoot: globalConfigRoot(),
+      })
+      return { content: [{ type: "text" as const, text: text ?? "" }] }
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: error instanceof Error ? error.message : String(error),
+          },
+        ],
+        isError: true,
+      }
+    }
+  })
 
   return server
 }

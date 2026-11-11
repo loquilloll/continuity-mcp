@@ -1,25 +1,17 @@
-/**
- * continuity-mcp — host-agnostic core.
- *
- * Port of pi-continuity-tool src/continuity.ts (originally
- * opencode-continuity-tool). Document format, memory IDs, delta ledger, and
- * compaction logic are byte-identical to the source. Host-specific paths are
- * MCP-native (the MCP stdio server adapter lives in src/index.ts):
- *   - global config sidecar:  $XDG_CONFIG_HOME/continuity/continuity.json
- *                             (or ~/.config/continuity/continuity.json)
- *   - project config sidecar: <worktree>/.continuity/continuity.json
- *   - delta ledger:           <tmp>/continuity-mcp-ledger/<worktreeHash>/<sessionId>.json
- *
- * tiktoken is loaded lazily (only the update+compaction path needs it) so the
- * module imports cleanly without top-level await.
- */
-
+// vendored from opencode-continuity-tool@d3c55ec - local edits marked mcp:
 import { createHash } from "crypto"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
+ 
+const tiktoken = await import("tiktoken")
 
-export const SECTIONS: string[] = [
+const get_encoding =
+  tiktoken.get_encoding ??
+  tiktoken.default?.get_encoding ??
+  tiktoken["module.exports"]?.get_encoding
+
+const SECTIONS = [
   "PLANS",
   "DECISIONS",
   "PROGRESS",
@@ -27,7 +19,7 @@ export const SECTIONS: string[] = [
   "OUTCOMES",
 ]
 
-export const PROVENANCE: string[] = [
+const PROVENANCE = [
   "USER",
   "CODE",
   "TOOL",
@@ -35,88 +27,17 @@ export const PROVENANCE: string[] = [
   "UNCONFIRMED",
 ]
 
-export type Section =
-  | "PLANS"
-  | "DECISIONS"
-  | "PROGRESS"
-  | "DISCOVERIES"
-  | "OUTCOMES"
-
-export type Provenance =
-  | "USER"
-  | "CODE"
-  | "TOOL"
-  | "ASSUMPTION"
-  | "UNCONFIRMED"
-
-export interface Update {
-  section: Section
-  provenance: Provenance
-  plan?: string
-  text: string
-}
-
-export interface CompactionConfigInput {
-  enabled?: boolean
-  upperTokenThreshold?: number
-  lowerTokenThreshold?: number
-  totalTokenThreshold?: number
-  encoding?: string
-}
-
-export interface ReadConfigInput {
-  linesPerSection?: number
-  mode?: "tail" | "delta"
-  sessionId?: string
-  includePinned?: boolean
-  includeUnresolved?: boolean
-}
-
-export interface ContinuityArgs {
-  command: "read" | "update"
-  updates?: Update[]
-  compaction?: CompactionConfigInput
-  read?: ReadConfigInput
-}
-
-export interface ToolContext {
-  worktree?: string
-  projectConfigPath?: string
-  globalConfigPath?: string
-  homeDirectory?: string
-}
-
-export interface ParsedEntry {
-  line: string
-  section: string
-  memoryId: string
-  timestamp: string
-  provenance: string
-  plan: string | null
-  status: string | null
-  pinned: boolean
-  text: string
-  normalizedContent: string
-  contentHash: string
-  isLegacy: boolean
-}
-
-export interface SessionLedger {
-  version: number
-  worktreeHash?: string
-  sessionId?: string
-  seen: Record<string, string>
-}
-
-interface TiktokenEncoder {
-  encode(text: string): { length: number }
-  free(): void
-}
-
-type GetEncoding = (name: string) => TiktokenEncoder
-
 const DEFAULT_UPPER_TOKEN_THRESHOLD = 10000
 const DEFAULT_ENCODING = "cl100k_base"
+let sharedEncoder
+
+function getDefaultEncoder() {
+  return sharedEncoder ??= get_encoding(DEFAULT_ENCODING)
+}
+
+export function tokens(text) {
+  return countTokensForContent(text, getDefaultEncoder())
+}
 const DEFAULT_READ_LINES_PER_SECTION = 5
 const DEFAULT_READ_MODE = "delta"
 const SESSION_LEDGER_VERSION = 1
@@ -124,7 +45,7 @@ const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const CONTINUITY_FILE_NAME = "CONTINUITY.md"
 const MEMORY_FILE_NAME = "MEMORY.md"
 
-const SECTION_RATIO_WEIGHTS: Record<string, number> = {
+const SECTION_RATIO_WEIGHTS = {
   PLANS: 4339,
   DECISIONS: 5175,
   PROGRESS: 22471,
@@ -172,19 +93,7 @@ const HEADER_PATTERN =
 const ENTRY_PATTERN =
   /^- (?:\[id:(?<memoryId>[^\]]+)\] )?(?<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z) (?<rest>.+)$/
 
-let tiktokenImport: Promise<any> | null = null
-
-async function loadGetEncoding(): Promise<GetEncoding> {
-  tiktokenImport ??= import("tiktoken")
-  const tiktoken: any = await tiktokenImport
-  return (
-    tiktoken.get_encoding ??
-    tiktoken.default?.get_encoding ??
-    tiktoken["module.exports"]?.get_encoding
-  )
-}
-
-function validateText(text: string) {
+function validateText(text) {
   if (text.includes("\n") || text.includes("\r")) {
     throw new Error("text must be a single line")
   }
@@ -196,35 +105,23 @@ function validateText(text: string) {
   }
 }
 
-export function normalizeMemoryContent(content: string) {
+function normalizeMemoryContent(content) {
   return content.replace(/\r\n?/g, "\n").replace(/\s+/g, " ").trim()
 }
 
-export function hashMemoryContent(content: string) {
+function hashMemoryContent(content) {
   return `sha256:${createHash("sha256")
     .update(normalizeMemoryContent(content), "utf8")
     .digest("hex")}`
 }
 
-function slugifyMemorySegment(value: string) {
+function slugifyMemorySegment(value) {
   const slug = value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "")
   return slug || "entry"
 }
 
-export function deriveMemoryId({
-  section,
-  timestamp,
-  provenance,
-  plan,
-  text,
-}: {
-  section?: string | null
-  timestamp?: string | null
-  provenance?: string | null
-  plan?: string | null
-  text?: string | null
-}) {
-  const normalizedText = normalizeMemoryContent(text ?? "")
+function deriveMemoryId({ section, timestamp, provenance, plan, text }) {
+  const normalizedText = normalizeMemoryContent(text)
   const compactTimestamp = (timestamp ?? "undated").replace(/[^0-9]/g, "") || "undated"
   const hash = hashMemoryContent(
     [section, timestamp ?? "", provenance ?? "", plan ?? "", normalizedText].join("|")
@@ -238,10 +135,7 @@ export function deriveMemoryId({
   ].join("-")
 }
 
-export function parseContinuityEntry(
-  line: string,
-  section: string | null = null
-): ParsedEntry | null {
+function parseContinuityEntry(line, section = null) {
   const match = line.match(ENTRY_PATTERN)
   if (!match?.groups) {
     return null
@@ -249,14 +143,14 @@ export function parseContinuityEntry(
 
   const { memoryId, timestamp, rest } = match.groups
   const metadata = {
-    provenance: null as string | null,
-    plan: null as string | null,
-    status: null as string | null,
+    provenance: null,
+    plan: null,
+    status: null,
     pinned: false,
   }
 
   let remaining = rest
-  const textPrefixes: string[] = []
+  const textPrefixes = []
   while (remaining.startsWith("[")) {
     const tokenEnd = remaining.indexOf("]")
     if (tokenEnd === -1) break
@@ -318,7 +212,7 @@ export function parseContinuityEntry(
   }
 }
 
-export function buildEntry(timestamp: string, update: Update) {
+function buildEntry(timestamp, update) {
   const memoryId = deriveMemoryId({
     section: update.section,
     timestamp,
@@ -330,14 +224,14 @@ export function buildEntry(timestamp: string, update: Update) {
   return `- [id:${memoryId}] ${timestamp} [${update.provenance}]${planSegment} ${update.text}`
 }
 
-function formatReadEntry(entry: ParsedEntry) {
+function formatReadEntry(entry) {
   const planSegment = entry.plan ? ` [plan:${entry.plan}]` : ""
   const statusSegment = entry.status ? ` [status:${entry.status}]` : ""
   const pinSegment = entry.pinned ? " [pin]" : ""
   return `- ${entry.timestamp} [${entry.provenance}]${planSegment}${statusSegment}${pinSegment} ${entry.text}`
 }
 
-function resolveCompactionConfig(input?: CompactionConfigInput) {
+function resolveCompactionConfig(input) {
   const enabled = input?.enabled ?? true
   const hasUpper = typeof input?.upperTokenThreshold === "number"
   const hasLower = typeof input?.lowerTokenThreshold === "number"
@@ -378,7 +272,7 @@ function resolveCompactionConfig(input?: CompactionConfigInput) {
   }
 }
 
-function resolveReadConfig(read?: ReadConfigInput) {
+function resolveReadConfig(read) {
   const linesPerSection =
     read?.linesPerSection ?? DEFAULT_READ_LINES_PER_SECTION
   const mode = read?.mode ?? DEFAULT_READ_MODE
@@ -408,20 +302,20 @@ function resolveReadConfig(read?: ReadConfigInput) {
   }
 }
 
-export function hashWorktreePath(worktree: string) {
+function hashWorktreePath(worktree) {
   return createHash("sha256").update(worktree, "utf8").digest("hex")
 }
 
-export function resolveLedgerPath(worktree: string, sessionId: string) {
+function resolveLedgerPath(worktree, sessionId) {
   return path.join(
     os.tmpdir(),
-    "continuity-mcp-ledger",
+    "opencode-continuity-ledger",
     hashWorktreePath(worktree),
     `${sessionId}.json`
   )
 }
 
-export function resolveWorktree(context: ToolContext | undefined, cwd: string = process.cwd()) {
+function resolveWorktree(context, cwd = process.cwd()) {
   const fallbackCwd = path.resolve(cwd)
   const configuredWorktree =
     typeof context?.worktree === "string" ? context.worktree.trim() : ""
@@ -443,27 +337,28 @@ export function resolveWorktree(context: ToolContext | undefined, cwd: string = 
   return resolvedWorktree
 }
 
-export function resolveGlobalConfigPath({
+function resolveGlobalConfigPath({
+  xdgConfigHome = process.env.XDG_CONFIG_HOME,
   homeDirectory = os.homedir(),
-}: {
-  homeDirectory?: string
 } = {}) {
-  const configRoot =
-    process.env.XDG_CONFIG_HOME?.trim() || path.join(homeDirectory, ".config")
-  return path.join(configRoot, "continuity", "continuity.json")
+  const configHome =
+    typeof xdgConfigHome === "string" && xdgConfigHome.trim()
+      ? xdgConfigHome.trim()
+      : path.join(homeDirectory, ".config")
+  return path.join(configHome, "opencode", "continuity.json")
 }
 
-export function resolveProjectConfigPath(worktree: string) {
-  return path.join(worktree, ".continuity", "continuity.json")
+function resolveProjectConfigPath(worktree) {
+  return path.join(worktree, ".opencode", "continuity.json")
 }
 
-export async function loadContinuityDirectoryConfig(configPath: string) {
+async function loadContinuityDirectoryConfig(configPath, io = fs) {
   let content
   try {
-    content = await fs.readFile(configPath, "utf8")
+    content = await io.readFile(configPath, "utf8")
   } catch (error) {
     if (error && typeof error === "object" && "code" in error) {
-      if ((error as { code?: string }).code === "ENOENT") return null
+      if (error.code === "ENOENT") return null
     }
     throw error
   }
@@ -487,10 +382,10 @@ export async function loadContinuityDirectoryConfig(configPath: string) {
     )
   }
 
-  return config.directory as string
+  return config.directory
 }
 
-export function resolveConfiguredDirectory(directory: string, worktree: string, homeDirectory: string = os.homedir()) {
+function resolveConfiguredDirectory(directory, worktree, homeDirectory = os.homedir()) {
   const configuredDirectory = directory.trim()
 
   if (configuredDirectory === "~") return homeDirectory
@@ -503,17 +398,15 @@ export function resolveConfiguredDirectory(directory: string, worktree: string, 
   return path.resolve(worktree, configuredDirectory)
 }
 
-export async function resolveContinuityDirectory(
-  worktree: string,
-  options: ToolContext = {}
-) {
+async function resolveContinuityDirectory(worktree, options = {}) {
+  const io = options.fs ?? fs
   const projectConfigPath =
     options.projectConfigPath ?? resolveProjectConfigPath(worktree)
   const globalConfigPath =
     options.globalConfigPath ?? resolveGlobalConfigPath(options)
-  const projectDirectory = await loadContinuityDirectoryConfig(projectConfigPath)
+  const projectDirectory = await loadContinuityDirectoryConfig(projectConfigPath, io)
   const globalDirectory =
-    projectDirectory ?? (await loadContinuityDirectoryConfig(globalConfigPath))
+    projectDirectory ?? (await loadContinuityDirectoryConfig(globalConfigPath, io))
   const configuredDirectory = globalDirectory ?? "docs"
   const sourcePath = projectDirectory
     ? projectConfigPath
@@ -536,12 +429,12 @@ export async function resolveContinuityDirectory(
   }
 
   try {
-    const stats = await fs.stat(directory)
+    const stats = await io.stat(directory)
     if (!stats.isDirectory()) {
       throw new Error(`Configured continuity directory is not a directory: ${directory}`)
     }
   } catch (error) {
-    if (error && typeof error === "object" && "code" in error && (error as { code?: string }).code === "ENOENT") {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
       return directory
     }
     if (sourcePath && error instanceof Error) {
@@ -553,10 +446,7 @@ export async function resolveContinuityDirectory(
   return directory
 }
 
-export async function resolveContinuityPaths(
-  worktree: string,
-  options: ToolContext = {}
-) {
+async function resolveContinuityPaths(worktree, options = {}) {
   const directory = await resolveContinuityDirectory(worktree, options)
   return {
     directory,
@@ -565,13 +455,9 @@ export async function resolveContinuityPaths(
   }
 }
 
-export async function loadSessionLedger(
-  filePath: string,
-  worktree: string,
-  sessionId?: string
-): Promise<SessionLedger> {
+async function loadSessionLedger(filePath, worktree, sessionId, io = fs) {
   try {
-    const content = await fs.readFile(filePath, "utf8")
+    const content = await io.readFile(filePath, "utf8")
     const parsed = JSON.parse(content)
     if (
       parsed &&
@@ -592,7 +478,7 @@ export async function loadSessionLedger(
       }
     }
     if (error && typeof error === "object" && "code" in error) {
-      if ((error as { code?: string }).code === "ENOENT") {
+      if (error.code === "ENOENT") {
         return {
           version: SESSION_LEDGER_VERSION,
           worktreeHash: hashWorktreePath(worktree),
@@ -616,15 +502,15 @@ export async function loadSessionLedger(
   }
 }
 
-export async function saveSessionLedger(filePath: string, ledger: SessionLedger) {
-  await fs.mkdir(path.dirname(filePath), { recursive: true })
+async function saveSessionLedger(filePath, ledger, io = fs) {
+  await io.mkdir(path.dirname(filePath), { recursive: true })
   const tempPath = `${filePath}.tmp`
-  await fs.writeFile(tempPath, JSON.stringify(ledger, null, 2), "utf8")
-  await fs.rename(tempPath, filePath)
+  await io.writeFile(tempPath, JSON.stringify(ledger, null, 2), "utf8")
+  await io.rename(tempPath, filePath)
 }
 
-function findSectionIndexes(lines: string[]) {
-  const indexBySection = new Map<string, number>()
+function findSectionIndexes(lines) {
+  const indexBySection = new Map()
 
   lines.forEach((line, index) => {
     const match = line.match(HEADER_PATTERN)
@@ -645,7 +531,7 @@ function findSectionIndexes(lines: string[]) {
   return indexBySection
 }
 
-function getSectionBoundaries(lines: string[]) {
+function getSectionBoundaries(lines) {
   const sectionIndexes = findSectionIndexes(lines)
   const boundaries = SECTIONS.map((section) => {
     const startIndex = sectionIndexes.get(section) ?? 0
@@ -662,7 +548,7 @@ function getSectionBoundaries(lines: string[]) {
   return boundaries
 }
 
-function computeInsertIndex(lines: string[], startIndex: number, endIndex: number) {
+function computeInsertIndex(lines, startIndex, endIndex) {
   let insertIndex = startIndex + 1
   for (let i = startIndex + 1; i < endIndex; i += 1) {
     if (lines[i].startsWith("- ")) {
@@ -672,16 +558,8 @@ function computeInsertIndex(lines: string[], startIndex: number, endIndex: numbe
   return insertIndex
 }
 
-function insertEntriesBySection(
-  lines: string[],
-  orderedSections: { section: string; startIndex: number; endIndex: number }[],
-  entriesBySection: Map<string, string[]>
-) {
-  const operations: {
-    section: string
-    insertIndex: number
-    entries: string[]
-  }[] = []
+function insertEntriesBySection(lines, orderedSections, entriesBySection) {
+  const operations = []
 
   orderedSections.forEach((current) => {
     const entries = entriesBySection.get(current.section)
@@ -705,14 +583,14 @@ function insertEntriesBySection(
   })
 }
 
-async function ensureContinuityFile(filePath: string) {
+async function ensureContinuityFile(filePath, io = fs) {
   try {
-    return await fs.readFile(filePath, "utf8")
+    return await io.readFile(filePath, "utf8")
   } catch (error) {
     if (error && typeof error === "object" && "code" in error) {
-      if ((error as { code?: string }).code === "ENOENT") {
-        await fs.mkdir(path.dirname(filePath), { recursive: true })
-        await fs.writeFile(filePath, TEMPLATE, "utf8")
+      if (error.code === "ENOENT") {
+        await io.mkdir(path.dirname(filePath), { recursive: true })
+        await io.writeFile(filePath, TEMPLATE, "utf8")
         return TEMPLATE
       }
     }
@@ -720,12 +598,12 @@ async function ensureContinuityFile(filePath: string) {
   }
 }
 
-async function readContinuityFile(filePath: string) {
+async function readContinuityFile(filePath, io = fs) {
   try {
-    return await fs.readFile(filePath, "utf8")
+    return await io.readFile(filePath, "utf8")
   } catch (error) {
     if (error && typeof error === "object" && "code" in error) {
-      if ((error as { code?: string }).code === "ENOENT") {
+      if (error.code === "ENOENT") {
         throw new Error(`CONTINUITY.md not found: ${filePath}`)
       }
     }
@@ -733,14 +611,14 @@ async function readContinuityFile(filePath: string) {
   }
 }
 
-async function ensureMemoryFile(filePath: string) {
+async function ensureMemoryFile(filePath, io = fs) {
   try {
-    return await fs.readFile(filePath, "utf8")
+    return await io.readFile(filePath, "utf8")
   } catch (error) {
     if (error && typeof error === "object" && "code" in error) {
-      if ((error as { code?: string }).code === "ENOENT") {
-        await fs.mkdir(path.dirname(filePath), { recursive: true })
-        await fs.writeFile(filePath, MEMORY_TEMPLATE, "utf8")
+      if (error.code === "ENOENT") {
+        await io.mkdir(path.dirname(filePath), { recursive: true })
+        await io.writeFile(filePath, MEMORY_TEMPLATE, "utf8")
         return MEMORY_TEMPLATE
       }
     }
@@ -748,9 +626,9 @@ async function ensureMemoryFile(filePath: string) {
   }
 }
 
-function getBulletEntries(lines: string[], encoder: TiktokenEncoder, hasTrailingNewline: boolean) {
-  const entries: { section: string; line: string; index: number; tokens: number }[] = []
-  let current: string | null = null
+function getBulletEntries(lines, encoder, hasTrailingNewline) {
+  const entries = []
+  let current = null
   lines.forEach((line, index) => {
     const match = line.match(HEADER_PATTERN)
     if (match) {
@@ -767,14 +645,14 @@ function getBulletEntries(lines: string[], encoder: TiktokenEncoder, hasTrailing
   return entries
 }
 
-function countTokensForContent(content: string, encoder: TiktokenEncoder) {
+function countTokensForContent(content, encoder) {
   if (content.length === 0) return 0
   return encoder.encode(content).length
 }
 
-function computeSectionBudgets(availableTokens: number) {
-  const budgets = new Map<string, number>()
-  const remainders: { section: string; remainder: number }[] = []
+function computeSectionBudgets(availableTokens) {
+  const budgets = new Map()
+  const remainders = []
   let allocated = 0
 
   SECTIONS.forEach((section) => {
@@ -800,13 +678,13 @@ function computeSectionBudgets(availableTokens: number) {
 }
 
 function truncateEntriesToTargetThreshold(
-  lines: string[],
-  entries: { section: string; line: string; index: number; tokens: number }[],
-  targetThreshold: number,
-  encoder: TiktokenEncoder,
-  hasTrailingNewline: boolean
+  lines,
+  entries,
+  targetThreshold,
+  encoder,
+  hasTrailingNewline
 ) {
-  const removedBySection = new Map<string, string[]>()
+  const removedBySection = new Map()
   if (entries.length === 0) {
     return removedBySection
   }
@@ -821,14 +699,14 @@ function truncateEntriesToTargetThreshold(
   const availableBulletTokens = Math.max(0, targetThreshold - headerTokens)
   const budgets = computeSectionBudgets(availableBulletTokens)
 
-  const entriesBySection = new Map<string, { section: string; line: string; index: number; tokens: number }[]>()
+  const entriesBySection = new Map()
   entries.forEach((entry) => {
     const existing = entriesBySection.get(entry.section) ?? []
     existing.push(entry)
     entriesBySection.set(entry.section, existing)
   })
 
-  const indexesToRemove: number[] = []
+  const indexesToRemove = []
   entriesBySection.forEach((sectionEntries, section) => {
     const budget = budgets.get(section) ?? 0
     let sectionTokens = sectionEntries.reduce(
@@ -864,8 +742,8 @@ function truncateEntriesToTargetThreshold(
       break
     }
 
-    const sectionTokens = new Map<string, number>()
-    const sectionEntries = new Map<string, { section: string; line: string; index: number; tokens: number }[]>()
+    const sectionTokens = new Map()
+    const sectionEntries = new Map()
     SECTIONS.forEach((section) => {
       sectionTokens.set(section, 0)
       sectionEntries.set(section, [])
@@ -884,7 +762,7 @@ function truncateEntriesToTargetThreshold(
     const availableBulletTokens = Math.max(0, targetThreshold - currentHeaderTokens)
     const ratioBudgets = computeSectionBudgets(availableBulletTokens)
 
-    let targetSection: string | null = null
+    let targetSection = null
     let maxOverage = Number.NEGATIVE_INFINITY
     SECTIONS.forEach((section) => {
       const sectionEntryList = sectionEntries.get(section) ?? []
@@ -932,12 +810,8 @@ function truncateEntriesToTargetThreshold(
   return removedBySection
 }
 
-function collectSectionTail(
-  lines: string[],
-  boundary: { section: string; startIndex: number; endIndex: number },
-  linesPerSection: number
-) {
-  const entries: string[] = []
+function collectSectionTail(lines, boundary, linesPerSection) {
+  const entries = []
   for (let i = boundary.startIndex + 1; i < boundary.endIndex; i += 1) {
     const line = lines[i]
     if (line.startsWith("- ")) {
@@ -951,12 +825,9 @@ function collectSectionTail(
   return entries.slice(entries.length - linesPerSection)
 }
 
-function collectParsedEntries(
-  lines: string[],
-  orderedSections: { section: string; startIndex: number; endIndex: number }[]
-) {
-  const entries: ParsedEntry[] = []
-  const seenExactEntries = new Set<string>()
+function collectParsedEntries(lines, orderedSections) {
+  const entries = []
+  const seenExactEntries = new Set()
 
   orderedSections.forEach((boundary) => {
     for (let i = boundary.startIndex + 1; i < boundary.endIndex; i += 1) {
@@ -982,8 +853,8 @@ function collectParsedEntries(
   return entries
 }
 
-function buildSectionedReadOutput(entriesBySection: Map<string, string[]>) {
-  const outputLines: string[] = []
+function buildSectionedReadOutput(entriesBySection) {
+  const outputLines = []
 
   SECTIONS.forEach((section, index) => {
     outputLines.push(`## [${section}]`)
@@ -997,12 +868,8 @@ function buildSectionedReadOutput(entriesBySection: Map<string, string[]>) {
   return outputLines.join("\n")
 }
 
-function collectDeltaEntries(
-  parsedEntries: ParsedEntry[],
-  ledger: SessionLedger,
-  readConfig: ReturnType<typeof resolveReadConfig>
-) {
-  const entriesBySection = new Map<string, string[]>(SECTIONS.map((section) => [section, []]))
+function collectDeltaEntries(parsedEntries, ledger, readConfig) {
+  const entriesBySection = new Map(SECTIONS.map((section) => [section, []]))
   let includedCount = 0
 
   parsedEntries.forEach((entry) => {
@@ -1026,145 +893,194 @@ function collectDeltaEntries(
   return { entriesBySection, includedCount }
 }
 
-export async function execute(
-  args: ContinuityArgs,
-  context: ToolContext = {}
-): Promise<string> {
-  const worktree = resolveWorktree(context)
-  const { continuityPath, memoryPath } = await resolveContinuityPaths(worktree, context)
+export {
+  SECTIONS,
+  PROVENANCE,
+  TEMPLATE,
+  MEMORY_TEMPLATE,
+  validateText,
+  resolveReadConfig,
+  resolveCompactionConfig,
+  findSectionIndexes,
+  getSectionBoundaries,
+  computeInsertIndex,
+  insertEntriesBySection,
+  ensureContinuityFile,
+  readContinuityFile,
+  ensureMemoryFile,
+  getBulletEntries,
+  countTokensForContent,
+  computeSectionBudgets,
+  truncateEntriesToTargetThreshold,
+  collectSectionTail,
+  collectParsedEntries,
+  formatReadEntry,
+  buildSectionedReadOutput,
+  collectDeltaEntries,
+  buildEntry,
+  deriveMemoryId,
+  hashMemoryContent,
+  hashWorktreePath,
+  loadContinuityDirectoryConfig,
+  loadSessionLedger,
+  normalizeMemoryContent,
+  parseContinuityEntry,
+  resolveLedgerPath,
+  resolveConfiguredDirectory,
+  resolveContinuityDirectory,
+  resolveContinuityPaths,
+  resolveGlobalConfigPath,
+  resolveProjectConfigPath,
+  resolveWorktree,
+  saveSessionLedger,
+}
 
-  if (args.command === "read") {
-    if (args.updates && args.updates.length > 0) {
-      throw new Error("updates are not supported for read command")
-    }
-    const readConfig = resolveReadConfig(args.read)
+export async function executeLegacy(args, context, options = {}) {
+    const io = options.fs ?? fs
+    const worktree = resolveWorktree(context)
+    const ledgerIdentity = options.ledgerIdentity ?? worktree
+    const paths = options.paths
+    const { continuityPath, memoryPath } = paths
+      ? {
+          continuityPath: paths.continuityPath ?? path.join(paths.directory, CONTINUITY_FILE_NAME),
+          memoryPath: paths.memoryPath ?? path.join(paths.directory, MEMORY_FILE_NAME),
+        }
+      : await resolveContinuityPaths(worktree, { fs: io })
 
-    const content = await readContinuityFile(continuityPath)
-    const lines = content.split(/\r?\n/)
-    const orderedSections = getSectionBoundaries(lines)
+    if (args.command === "read") {
+      if (args.updates && args.updates.length > 0) {
+        throw new Error("updates are not supported for read command")
+      }
+      const readConfig = resolveReadConfig(args.read)
 
-    if (readConfig.mode === "tail") {
-      const entriesBySection = new Map<string, string[]>()
-      orderedSections.forEach((boundary) => {
-        entriesBySection.set(
-          boundary.section,
-          collectSectionTail(lines, boundary, readConfig.linesPerSection)
-        )
-      })
+      const content = await readContinuityFile(continuityPath, io)
+      const lines = content.split(/\r?\n/)
+      const orderedSections = getSectionBoundaries(lines)
+
+      if (readConfig.mode === "tail") {
+        const entriesBySection = new Map()
+        orderedSections.forEach((boundary) => {
+          entriesBySection.set(
+            boundary.section,
+            collectSectionTail(lines, boundary, readConfig.linesPerSection)
+          )
+        })
+        return buildSectionedReadOutput(entriesBySection)
+      }
+
+      const parsedEntries = collectParsedEntries(lines, orderedSections)
+      const ledgerPath = resolveLedgerPath(ledgerIdentity, readConfig.sessionId)
+      const ledger = await loadSessionLedger(
+        ledgerPath,
+        ledgerIdentity,
+        readConfig.sessionId,
+        io
+      )
+      const { entriesBySection, includedCount } = collectDeltaEntries(
+        parsedEntries,
+        ledger,
+        readConfig
+      )
+
+      if (includedCount === 0) {
+        return "No new or changed task memories."
+      }
+
+      await saveSessionLedger(ledgerPath, ledger, io)
       return buildSectionedReadOutput(entriesBySection)
     }
 
-    const parsedEntries = collectParsedEntries(lines, orderedSections)
-    const ledgerPath = resolveLedgerPath(worktree, readConfig.sessionId!)
-    const ledger = await loadSessionLedger(
-      ledgerPath,
-      worktree,
-      readConfig.sessionId
-    )
-    const { entriesBySection, includedCount } = collectDeltaEntries(
-      parsedEntries,
-      ledger,
-      readConfig
-    )
-
-    if (includedCount === 0) {
-      return "No new or changed task memories."
+    if (!args.updates || args.updates.length === 0) {
+      throw new Error("updates must be provided for update command")
     }
 
-    await saveSessionLedger(ledgerPath, ledger)
-    return buildSectionedReadOutput(entriesBySection)
-  }
+    const timestamp = options.timestamp ?? `${new Date().toISOString().slice(0, 16)}Z`
+    const compactionConfig = resolveCompactionConfig(args.compaction)
 
-  if (!args.updates || args.updates.length === 0) {
-    throw new Error("updates must be provided for update command")
-  }
+    const updatesBySection = new Map()
+    args.updates.forEach((update) => {
+      validateText(update.text)
+      const entry = buildEntry(timestamp, update)
+      const entries = updatesBySection.get(update.section) ?? []
+      entries.push(entry)
+      updatesBySection.set(update.section, entries)
+    })
 
-  const timestamp = `${new Date().toISOString().slice(0, 16)}Z`
-  const compactionConfig = resolveCompactionConfig(args.compaction)
+    const content = await ensureContinuityFile(continuityPath, io)
+    const hasTrailingNewline = content.endsWith("\n")
+    const lines = content.split(/\r?\n/)
 
-  const updatesBySection = new Map<string, string[]>()
-  args.updates.forEach((update) => {
-    validateText(update.text)
-    const entry = buildEntry(timestamp, update)
-    const entries = updatesBySection.get(update.section) ?? []
-    entries.push(entry)
-    updatesBySection.set(update.section, entries)
-  })
+    const orderedSections = getSectionBoundaries(lines)
+    insertEntriesBySection(lines, orderedSections, updatesBySection)
 
-  const content = await ensureContinuityFile(continuityPath)
-  const hasTrailingNewline = content.endsWith("\n")
-  const lines = content.split(/\r?\n/)
+    const compactionEntriesBySection = new Map()
+    let removedBySection = new Map()
+    if (compactionConfig.enabled) {
+      const encoder = compactionConfig.encoding === DEFAULT_ENCODING
+        ? getDefaultEncoder()
+        : get_encoding(compactionConfig.encoding)
+      try {
+        const totalTokens = countTokensForContent(lines.join("\n"), encoder)
 
-  const orderedSections = getSectionBoundaries(lines)
-  insertEntriesBySection(lines, orderedSections, updatesBySection)
-
-  const compactionEntriesBySection = new Map<string, string[]>()
-  let removedBySection = new Map<string, string[]>()
-  if (compactionConfig.enabled) {
-    const get_encoding = await loadGetEncoding()
-    const encoder = get_encoding(compactionConfig.encoding)
-    try {
-      const totalTokens = countTokensForContent(lines.join("\n"), encoder)
-
-      if (totalTokens > compactionConfig.upperTokenThreshold) {
-        const compactionEntry = buildEntry(timestamp, {
-          section: "DISCOVERIES",
-          provenance: "TOOL",
-          text: "Compaction triggered: exceeded upper token threshold; truncated oldest entries to at or below lower target; archived to MEMORY.md.",
-        })
-        compactionEntriesBySection.set("DISCOVERIES", [compactionEntry])
-        insertEntriesBySection(
-          lines,
-          orderedSections,
-          compactionEntriesBySection
-        )
-
-        const entriesAfter = getBulletEntries(
-          lines,
-          encoder,
-          hasTrailingNewline
-        )
-        removedBySection =
-          truncateEntriesToTargetThreshold(
+        if (totalTokens > compactionConfig.upperTokenThreshold) {
+          const compactionEntry = buildEntry(timestamp, {
+            section: "DISCOVERIES",
+            provenance: "TOOL",
+            text: "Compaction triggered: exceeded upper token threshold; truncated oldest entries to at or below lower target; archived to MEMORY.md.",
+          })
+          compactionEntriesBySection.set("DISCOVERIES", [compactionEntry])
+          insertEntriesBySection(
             lines,
-            entriesAfter,
-            compactionConfig.lowerTokenThreshold,
+            orderedSections,
+            compactionEntriesBySection
+          )
+
+          const entriesAfter = getBulletEntries(
+            lines,
             encoder,
             hasTrailingNewline
-          ) ?? new Map()
+          )
+          removedBySection =
+            truncateEntriesToTargetThreshold(
+              lines,
+              entriesAfter,
+              compactionConfig.lowerTokenThreshold,
+              encoder,
+              hasTrailingNewline
+            ) ?? new Map()
 
-        if (removedBySection.size > 0) {
-          const memoryContent = await ensureMemoryFile(memoryPath)
-          const memoryHasTrailingNewline = memoryContent.endsWith("\n")
-          const memoryLines = memoryContent.split(/\r?\n/)
-          const memorySections = getSectionBoundaries(memoryLines)
-          insertEntriesBySection(memoryLines, memorySections, removedBySection)
+          if (removedBySection.size > 0) {
+            const memoryContent = await ensureMemoryFile(memoryPath, io)
+            const memoryHasTrailingNewline = memoryContent.endsWith("\n")
+            const memoryLines = memoryContent.split(/\r?\n/)
+            const memorySections = getSectionBoundaries(memoryLines)
+            insertEntriesBySection(memoryLines, memorySections, removedBySection)
 
-          let memoryOutput = memoryLines.join("\n")
-          if (memoryHasTrailingNewline && !memoryOutput.endsWith("\n")) {
-            memoryOutput += "\n"
+            let memoryOutput = memoryLines.join("\n")
+            if (memoryHasTrailingNewline && !memoryOutput.endsWith("\n")) {
+              memoryOutput += "\n"
+            }
+            if (!memoryHasTrailingNewline && memoryOutput.endsWith("\n")) {
+              memoryOutput = memoryOutput.replace(/\n$/, "")
+            }
+            await io.writeFile(memoryPath, memoryOutput, "utf8")
+
           }
-          if (!memoryHasTrailingNewline && memoryOutput.endsWith("\n")) {
-            memoryOutput = memoryOutput.replace(/\n$/, "")
-          }
-          await fs.writeFile(memoryPath, memoryOutput, "utf8")
-
         }
+      } finally {
+        if (encoder !== sharedEncoder) encoder.free()
       }
-    } finally {
-      encoder.free()
     }
-  }
 
-  let output = lines.join("\n")
-  if (hasTrailingNewline && !output.endsWith("\n")) {
-    output += "\n"
-  }
-  if (!hasTrailingNewline && output.endsWith("\n")) {
-    output = output.replace(/\n$/, "")
-  }
+    let output = lines.join("\n")
+    if (hasTrailingNewline && !output.endsWith("\n")) {
+      output += "\n"
+    }
+    if (!hasTrailingNewline && output.endsWith("\n")) {
+      output = output.replace(/\n$/, "")
+    }
 
-  await fs.writeFile(continuityPath, output, "utf8")
+    await io.writeFile(continuityPath, output, "utf8")
 
-  return ""
+    return ""
 }

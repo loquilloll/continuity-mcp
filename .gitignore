@@ -8,3 +8,6 @@ docs/MEMORY.md
 # Tooling caches
 .ast-grep/
 tmp/
+
+# Local agent state (plans contain machine paths)
+.opencode/
