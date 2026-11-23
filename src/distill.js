@@ -204,8 +204,10 @@ export function applyProposals(memory, output) {
   return { shared, checkpoint, conflicts };
 }
 
-/** Generate is injected by a no-tools runtime adapter. No SDK or provider fallback. */
-export async function runDistillation(scope, { generate, manual = false, workspace = scope.workspace, now, modelContext } = {}) {
+/** Generate is injected by a no-tools runtime adapter. No SDK or provider fallback.
+ * mcp: dry=true (via prepareDistillation) stops after selection and returns the prompt
+ * without taking the claim, so a human/agent can answer it in a later process. */
+export async function runDistillation(scope, { generate, manual = false, workspace = scope.workspace, now, modelContext, dry = false } = {}) {
   const started = clock(now);
   let acquired;
   try {
@@ -252,6 +254,9 @@ export async function runDistillation(scope, { generate, manual = false, workspa
       assert(selected.length, "No source available for epoch owner");
       const prompt = promptFor(memory, selected);
       if (modelContext !== undefined) assert(Number.isFinite(modelContext) && tokens(prompt) + 4000 <= modelContext, "Configured model context cannot fit input plus output reserve");
+      // mcp: manual phase 1 — hand out the request without claiming; phase 2 (--apply) re-selects
+      // the same deterministic batch and claims only for the instant of validation.
+      if (dry) return { status: "prepared", memory, selected, prompt, model: settings(state.epoch.snapshot).model, conflictsRevision: memory.revisions.conflicts };
       const claim = { token: randomUUID(), pid: process.pid, processStart: stamp(Date.now() - process.uptime() * 1000), startedAt: stamp(started), deadline: stamp(started + 300000),
         epochRevision: state.epoch.revision, checkpointRevision: memory.revisions.checkpoint, sharedRevision: memory.revisions.shared,
         configHash: state.epoch.configHash, batch: selected.map(({ sequence, id, contentHash }) => ({ sequence, id, contentHash })) };
@@ -346,4 +351,9 @@ export async function runDistillation(scope, { generate, manual = false, workspa
     }
     return { status: "blocked", error: error.message };
   }
+}
+
+// mcp: CLI manual distillation phase 1 — the exact distillation request with no claim taken.
+export function prepareDistillation(scope, options = {}) {
+  return runDistillation(scope, { ...options, dry: true })
 }

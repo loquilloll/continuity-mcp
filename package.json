@@ -2,9 +2,14 @@
   "name": "continuity-mcp",
   "private": true,
   "type": "module",
+  "bin": {
+    "continuity": "src/cli.ts",
+    "continuity-mcp": "src/index.ts"
+  },
   "description": "MCP stdio server: branch-isolated continuity memory (read/update/status/search/distill, distillation via MCP sampling). Port of the opencode-continuity-tool redesign.",
   "scripts": {
     "start": "node src/index.ts",
+    "cli": "node src/cli.ts",
     "test": "node --test \"tests/**/*.test.ts\"",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

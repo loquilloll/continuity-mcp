@@ -30,7 +30,15 @@ Not included: auto-scheduling of distillation (this server runs distill only on 
 
 ## Installation
 
-The server is started with `node src/index.ts` from this repository. Because MCP clients differ in whether they spawn the server with your project directory as the working directory, **always set `CONTINUITY_WORKTREE`** to the project root (the server falls back to the process working directory).
+Install globally from a checkout (Node ≥ 22.18 runs the TypeScript sources natively; `private` only blocks publishing, not installing):
+
+```bash
+npm install -g /path/to/continuity-mcp
+```
+
+This provides two commands, usable from any directory: `continuity` (the CLI, see below) and `continuity-mcp` (the stdio server). For development, `npm link` does the same from the checkout. To remove: `npm rm -g continuity-mcp`.
+
+Alternatively, run straight from the checkout with `node src/index.ts` (server) / `node src/cli.ts` (CLI). Because MCP clients differ in whether they spawn the server with your project directory as the working directory, **always set `CONTINUITY_WORKTREE`** to the project root when configuring the server (the server falls back to the process working directory).
 
 ### VS Code
 
@@ -41,8 +49,7 @@ The server is started with `node src/index.ts` from this repository. Because MCP
   "servers": {
     "continuity": {
       "type": "stdio",
-      "command": "node",
-      "args": ["/path/to/continuity-mcp/src/index.ts"],
+      "command": "continuity-mcp",
       "env": { "CONTINUITY_WORKTREE": "${workspaceFolder}" }
     }
   }
@@ -60,7 +67,7 @@ For `distill` to work, sampling must be enabled (`chat.mcp.serverSampling` in VS
   "mcp": {
     "continuity": {
       "type": "local",
-      "command": ["node", "/path/to/continuity-mcp/src/index.ts"],
+      "command": ["continuity-mcp"],
       "cwd": "."
     }
   }
@@ -70,7 +77,7 @@ For `distill` to work, sampling must be enabled (`chat.mcp.serverSampling` in VS
 ### Claude Code
 
 ```bash
-claude mcp add continuity --env CONTINUITY_WORKTREE=/path/to/project -- node /path/to/continuity-mcp/src/index.ts
+claude mcp add continuity --env CONTINUITY_WORKTREE=/path/to/project -- continuity-mcp
 ```
 
 For Claude Desktop, add the equivalent `mcpServers` entry (`command`, `args`, `env`) to `claude_desktop_config.json`.
@@ -112,6 +119,41 @@ On the first tool call in a Git repository, the new store is created and existin
 
 `[PLANS]` (next steps/checklists) · `[DECISIONS]` (choices + rationale) · `[PROGRESS]` (course changes and why) · `[DISCOVERIES]` (behaviors, tradeoffs, bugs) · `[OUTCOMES]` (achieved/remaining/lessons). Provenance on every entry: `USER`, `CODE`, `TOOL`, `ASSUMPTION`, `UNCONFIRMED`.
 
+## CLI
+
+`src/cli.ts` is a terminal front end over the same store and the same tool entry point as the MCP server — handy for inspecting what agents wrote, or recording entries yourself. Installed (`npm install -g`), the command is just `continuity`; from the checkout use `node src/cli.ts`:
+
+```bash
+continuity update --section PROGRESS --provenance USER --text "switched auth to tokens"
+continuity read --mode tail               # delta is the default, like the tool
+continuity search token refresh           # query = words after the command
+continuity search --all flaky             # every branch
+continuity status
+```
+
+`--branch <name>` targets another branch, `--worktree <path>` overrides the project root (else `$CONTINUITY_WORKTREE`, else the cwd). Delta reads use session id `cli` (`--session` to isolate).
+
+### Manual distillation (CLI + skill)
+
+The CLI replaces MCP sampling with a two-phase flow you drive by hand:
+
+```bash
+continuity distill --prompt              # 1. prints the distillation request (claims nothing)
+#                                          2. get ANY model to answer it — or use the skill below
+continuity distill --apply answer.json   # 3. commits the answer ("-" reads stdin)
+```
+
+`--prompt` selects the same deterministic batch the server would and reports store status (`clean`, `already-running`, `blocked`) when there is nothing to answer. `--apply` re-selects that batch, takes the store claim, and validates your answer transactionally — citations must match the request's `sources` exactly; a rejected answer leaves all sources pending. If the store changed between the phases so the batch differs, `--apply` fails safely; regenerate the prompt and re-answer.
+
+**The `distill` skill** ([`skills/distill/SKILL.md`](skills/distill/SKILL.md)) makes your agent the model: copy it into the project as `.opencode/skill/distill/SKILL.md` (OpenCode discovers it there), then invoke it manually when you want a distillation run. It runs `--prompt`, answers the request itself under the request's citation rules, and commits via `--apply` — keyless and manual, matching this server's no-auto-distillation stance.
+
+### Skills
+
+Two agent skills ship in [`skills/`](skills/), each installed by copying its folder into the project as `.opencode/skill/<name>/` (OpenCode discovers them there; other agents can read them as plain instructions):
+
+- **`continuity`** — memory hygiene for any agent working in the repo: read the delta briefing at task start, record deliberate entries (PLANS/DECISIONS/PROGRESS/DISCOVERIES/OUTCOMES with provenance) as work proceeds, search past entries. The tool description references exactly this skill.
+- **`distill`** — the manual two-phase distillation run described above.
+
 ## Project structure
 
 ```
@@ -121,6 +163,9 @@ continuity-mcp/
     distill.js, config.js, scheduler.js, # (scheduler vendored unwired; no auto-distill in v2.0)
     schema.js
     index.ts                             # MCP stdio host adapter (tool, sampling, session defaults)
+    cli.ts                               # CLI host adapter (argv → same tool entry point)
+    skills/distill/SKILL.md              # manually-invoked agent skill: agent answers the distill prompt
+    skills/continuity/SKILL.md           # agent skill: read/record/search continuity via the CLI
   tests/
     *.test.ts                            # ported upstream suites + MCP adapter suite
     expect.ts                            # bun:test→node:assert matcher bridge

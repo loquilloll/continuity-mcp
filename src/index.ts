@@ -41,7 +41,7 @@ const DESCRIPTION =
   " In MCP, the delta read sessionId defaults to the connected client's name."
 
 // Mirrors upstream plugin.js globalConfigRoot so global settings are shared with the opencode plugin.
-function globalConfigRoot(): string {
+export function globalConfigRoot(): string {
   return process.env.OPENCODE_CONFIG_DIR ??
     path.join(
       process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"),
@@ -52,7 +52,7 @@ function globalConfigRoot(): string {
 // Host wrapper equivalent of upstream src/continuity.js execute() — the MCP host has no
 // @opencode-ai/plugin tool() wrapper, so the non-Git dispatch lives here.
 export const continuityTool = {
-  async execute(args: any, context: { worktree: string }, options: Record<string, unknown> = {}) {
+  async execute(args: any, context: { worktree: string; sessionID?: string }, options: Record<string, unknown> = {}) {
     if (typeof context?.worktree !== "string") throw new Error("Continuity requires an attributed workspace")
     const scope = await resolveScope({ workspace: context.worktree, branch: undefined })
     // Keep the historical non-Git custom-tool contract; plugins always use the transactional runtime.
